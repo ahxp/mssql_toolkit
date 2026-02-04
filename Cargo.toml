@@ -1,0 +1,59 @@
+[package]
+name = "mssql_toolkit"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ahmed Abdullah"]
+description = "A comprehensive MSSQL database management library for Rust"
+license = "MIT"
+repository = "https://github.com/ahmedabdullah/mssql-rust-library"
+keywords = ["mssql", "database", "sql-server", "orm", "query-builder"]
+categories = ["database"]
+
+[dependencies]
+# MSSQL Driver - Using only rustls (not native-tls) to avoid TLS conflicts
+tiberius = { version = "0.12", default-features = false, features = ["rustls", "chrono", "rust_decimal", "bigdecimal", "tds73"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+# Connection pooling
+bb8 = "0.8"
+
+# Async traits
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Decimal types
+rust_decimal = { version = "1.33", features = ["serde"] }
+bigdecimal = { version = "0.4", features = ["serde"] }
+
+# UUID support
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+
+# Derive macros
+derive_builder = "0.12"
+
+# Futures
+futures = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+pretty_assertions = "1.4"
+dotenv = "0.15"
+
+[features]
+default = ["pool-bb8"]
+pool-bb8 = []
+migrations = []
