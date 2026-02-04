@@ -1,4 +1,4 @@
-# mssql_toolkit
+# mssql_toolkit Library
 
 A comprehensive Rust library for Microsoft SQL Server database management.
 
