@@ -7,7 +7,7 @@ pub mod config;
 
 use std::sync::Arc;
 
-use tiberius::{Client, QueryStream, Row};
+use tiberius::{Client, ColumnData, FromSql, QueryStream, Row, ToSql};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -20,7 +20,7 @@ use crate::types::SqlValue;
 
 /// Represents a connection to an MSSQL database.
 pub struct MssqlConnection {
-    client: Arc<Mutex<Client<Compat<TcpStream>>>>,
+    pub(crate) client: Arc<Mutex<Option<Client<Compat<TcpStream>>>>>,
     config: ConnectionConfig,
     is_closed: bool,
 }
@@ -88,7 +88,7 @@ impl MssqlConnection {
         );
 
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
+            client: Arc::new(Mutex::new(Some(client))),
             config,
             is_closed: false,
         })
@@ -107,24 +107,9 @@ impl MssqlConnection {
         sql: &str,
         params: &[SqlValue],
     ) -> MssqlResult<Vec<MssqlRow>> {
-        let mut client = self.client.lock().await;
-
-        debug!("Executing query with {} parameters", params.len());
-
-        // For now, we only support parameterless queries
-        // Parameterized queries require more complex handling
-        let stream = client.query(sql, &[]).await;
-
-        let stream = stream.map_err(|e| {
-            error!("Query execution failed: {}", e);
-            query_error_from_tiberius(e)
-        })?;
-
-        // Collect all rows
-        let rows = stream_to_rows(stream).await?;
-
-        debug!("Query returned {} rows", rows.len());
-        Ok(rows)
+        let mut guard = self.client.lock().await;
+        let client = guard.as_mut().ok_or(MssqlError::Connection(ConnectionError::ConnectionClosed))?;
+        query_on_client(client, sql, params).await
     }
 
     /// Execute a query that returns a single row.
@@ -156,37 +141,17 @@ impl MssqlConnection {
     /// Execute a non-query command (INSERT, UPDATE, DELETE, etc.).
     #[instrument(skip(self, params), fields(sql = %sql))]
     pub async fn execute(&self, sql: &str, params: &[SqlValue]) -> MssqlResult<u64> {
-        let mut client = self.client.lock().await;
-
-        debug!("Executing command with {} parameters", params.len());
-
-        // For now, we only support parameterless execution
-        let result = client.execute(sql, &[]).await;
-
-        let result = result.map_err(|e| {
-            error!("Command execution failed: {}", e);
-            query_error_from_tiberius(e)
-        })?;
-
-        let rows_affected = result.total();
-        debug!("Command affected {} rows", rows_affected);
-
-        Ok(rows_affected)
+        let mut guard = self.client.lock().await;
+        let client = guard.as_mut().ok_or(MssqlError::Connection(ConnectionError::ConnectionClosed))?;
+        execute_on_client(client, sql, params).await
     }
 
     /// Execute a batch of SQL statements.
     #[instrument(skip(self))]
     pub async fn execute_batch(&self, sql: &str) -> MssqlResult<()> {
-        let mut client = self.client.lock().await;
-
-        debug!("Executing batch query");
-
-        client.simple_query(sql).await.map_err(|e| {
-            error!("Batch execution failed: {}", e);
-            query_error_from_tiberius(e)
-        })?;
-
-        Ok(())
+        let mut guard = self.client.lock().await;
+        let client = guard.as_mut().ok_or(MssqlError::Connection(ConnectionError::ConnectionClosed))?;
+        batch_on_client(client, sql).await
     }
 
     /// Execute a query and return a scalar value.
@@ -439,7 +404,7 @@ impl FromSqlRow for bool {
 // Parameter conversion is handled inline for now
 // Future: implement proper parameterized query support
 
-fn query_error_from_tiberius(e: tiberius::error::Error) -> MssqlError {
+pub(crate) fn query_error_from_tiberius(e: tiberius::error::Error) -> MssqlError {
     match e {
         tiberius::error::Error::Server(ref server_err) => {
             let msg = server_err.message();
@@ -476,7 +441,7 @@ fn extract_identifier(msg: &str) -> String {
     "unknown".to_string()
 }
 
-async fn stream_to_rows(mut stream: QueryStream<'_>) -> MssqlResult<Vec<MssqlRow>> {
+pub(crate) async fn stream_to_rows(mut stream: QueryStream<'_>) -> MssqlResult<Vec<MssqlRow>> {
     use futures::TryStreamExt;
 
     let mut rows = Vec::new();
@@ -503,38 +468,100 @@ async fn stream_to_rows(mut stream: QueryStream<'_>) -> MssqlResult<Vec<MssqlRow
     Ok(rows)
 }
 
-fn tiberius_row_to_values(row: &Row, column_count: usize) -> MssqlResult<Vec<SqlValue>> {
-    let mut values = Vec::with_capacity(column_count);
+pub(crate) async fn query_on_client(client: &mut Client<Compat<TcpStream>>, sql: &str, params: &[SqlValue]) -> MssqlResult<Vec<MssqlRow>> {
+    let bindings: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
+    let stream = client.query(sql, &bindings).await.map_err(query_error_from_tiberius)?;
+    stream_to_rows(stream).await
+}
 
-    for i in 0..column_count {
-        // Try different types
-        let value = if let Some(v) = row.try_get::<i32, _>(i).ok().flatten() {
-            SqlValue::Int(v)
-        } else if let Some(v) = row.try_get::<i64, _>(i).ok().flatten() {
-            SqlValue::BigInt(v)
-        } else if let Some(v) = row.try_get::<bool, _>(i).ok().flatten() {
-            SqlValue::Bool(v)
-        } else if let Some(v) = row.try_get::<f32, _>(i).ok().flatten() {
-            SqlValue::Float(v)
-        } else if let Some(v) = row.try_get::<f64, _>(i).ok().flatten() {
-            SqlValue::Double(v)
-        } else if let Some(v) = row.try_get::<&str, _>(i).ok().flatten() {
-            SqlValue::String(v.to_string())
-        } else if let Some(v) = row.try_get::<uuid::Uuid, _>(i).ok().flatten() {
-            SqlValue::Uuid(v)
-        } else {
-            SqlValue::Null
-        };
+pub(crate) async fn execute_on_client(client: &mut Client<Compat<TcpStream>>, sql: &str, params: &[SqlValue]) -> MssqlResult<u64> {
+    let bindings: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
+    Ok(client.execute(sql, &bindings).await.map_err(query_error_from_tiberius)?.total())
+}
 
-        values.push(value);
+pub(crate) async fn batch_on_client(client: &mut Client<Compat<TcpStream>>, sql: &str) -> MssqlResult<()> {
+    use futures::TryStreamExt;
+    let mut stream = client.simple_query(sql).await.map_err(query_error_from_tiberius)?;
+    while stream.try_next().await.map_err(query_error_from_tiberius)?.is_some() {}
+    Ok(())
+}
+
+// Use one conversion path for direct and pooled connections. Never turn an
+// unsupported non-NULL database value into NULL.
+fn tiberius_row_to_values(row: &Row, _column_count: usize) -> MssqlResult<Vec<SqlValue>> {
+    row.cells().enumerate().map(|(index, (column, data))| {
+        let conversion_error = |message: String| MssqlError::Query(QueryError::MappingError(
+            format!("column {} ({}): {}", index, column.name(), message),
+        ));
+        macro_rules! decode {
+            ($ty:ty, $variant:ident) => {{
+                <$ty as FromSql>::from_sql(data)
+                    .map_err(|e| conversion_error(e.to_string()))?
+                    .map(SqlValue::$variant).unwrap_or(SqlValue::Null)
+            }};
+        }
+        Ok(match data {
+            ColumnData::U8(_) => decode!(u8, TinyInt),
+            ColumnData::I16(_) => decode!(i16, SmallInt),
+            ColumnData::I32(_) => decode!(i32, Int),
+            ColumnData::I64(_) => decode!(i64, BigInt),
+            ColumnData::F32(_) => decode!(f32, Float),
+            ColumnData::F64(_) => decode!(f64, Double),
+            ColumnData::Bit(_) => decode!(bool, Bool),
+            ColumnData::String(v) => v.as_ref().map(|v| SqlValue::String(v.to_string())).unwrap_or(SqlValue::Null),
+            ColumnData::Binary(v) => v.as_ref().map(|v| SqlValue::Binary(v.to_vec())).unwrap_or(SqlValue::Null),
+            ColumnData::Guid(_) => decode!(uuid::Uuid, Uuid),
+            ColumnData::Numeric(v) => match v {
+                None => SqlValue::Null,
+                Some(n) => SqlValue::Decimal(rust_decimal::Decimal::try_from_i128_with_scale(n.value(), n.scale() as u32)
+                    .map_err(|e| conversion_error(e.to_string()))?),
+            },
+            ColumnData::Date(_) => decode!(chrono::NaiveDate, Date),
+            ColumnData::Time(_) => decode!(chrono::NaiveTime, Time),
+            ColumnData::DateTime(_) | ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => decode!(chrono::NaiveDateTime, DateTime),
+            ColumnData::DateTimeOffset(_) => decode!(chrono::DateTime<chrono::Utc>, DateTimeUtc),
+            ColumnData::Xml(None) => SqlValue::Null,
+            ColumnData::Xml(Some(_)) => return Err(conversion_error("XML values are not supported".into())),
+        })
+    }).collect()
+}
+
+impl ToSql for SqlValue {
+    fn to_sql(&self) -> ColumnData<'_> {
+        match self {
+            Self::Null => ColumnData::I32(None),
+            Self::Bool(v) => v.to_sql(),
+            Self::TinyInt(v) => v.to_sql(),
+            Self::SmallInt(v) => v.to_sql(),
+            Self::Int(v) => v.to_sql(),
+            Self::BigInt(v) => v.to_sql(),
+            Self::Float(v) => v.to_sql(),
+            Self::Double(v) => v.to_sql(),
+            Self::Decimal(v) => v.to_sql(),
+            Self::String(v) => v.to_sql(),
+            Self::Binary(v) => v.to_sql(),
+            Self::Date(v) => v.to_sql(),
+            Self::Time(v) => v.to_sql(),
+            Self::DateTime(v) => v.to_sql(),
+            Self::DateTimeUtc(v) => v.to_sql(),
+            Self::Uuid(v) => v.to_sql(),
+            Self::Json(v) => ColumnData::String(Some(std::borrow::Cow::Owned(v.to_string()))),
+        }
     }
-
-    Ok(values)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_values_bind_with_native_driver_types() {
+        assert!(matches!(SqlValue::Int(42).to_sql(), ColumnData::I32(Some(42))));
+        assert!(matches!(SqlValue::Null.to_sql(), ColumnData::I32(None)));
+        assert!(matches!(SqlValue::Binary(vec![1, 2]).to_sql(), ColumnData::Binary(Some(v)) if v.as_ref() == [1, 2]));
+        assert!(matches!(SqlValue::Json(serde_json::json!({"a": 1})).to_sql(), ColumnData::String(Some(v)) if v.as_ref() == "{\"a\":1}"));
+    }
+
 
     #[test]
     fn test_mssql_row_get() {

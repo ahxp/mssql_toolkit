@@ -1,5 +1,6 @@
 //! Column definition builder.
 
+use crate::query::expression::quote_identifier;
 use crate::types::{SqlType, VarCharLength};
 
 /// Column definition for table creation.
@@ -180,7 +181,7 @@ impl ColumnDefinition {
         let mut parts = Vec::new();
 
         // Column name
-        parts.push(format!("[{}]", self.name));
+        parts.push(quote_identifier(&self.name));
 
         // Computed column
         if let Some(ref computed) = self.computed {
@@ -489,6 +490,11 @@ pub fn column(name: impl Into<String>) -> ColumnBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escapes_closing_brackets_in_column_names() {
+        assert_eq!(column("a]b").int().to_sql(), "[a]]b] INT NULL");
+    }
 
     #[test]
     fn test_basic_column() {

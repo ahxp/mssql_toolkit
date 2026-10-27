@@ -274,7 +274,12 @@ impl QueryBuilder for InsertBuilder {
     }
 
     fn build_with_params(&self) -> MssqlResult<(String, Vec<SqlValue>)> {
-        Ok((self.build()?, Vec::new()))
+        let mut query = self.clone();
+        let mut params = Vec::new();
+        for output in &mut query.output { if let OutputColumn::Expression { expr, .. } = output { expr.collect_params(&mut params)?; } }
+        if let Some(select) = &mut query.select { select.collect_params(&mut params)?; }
+        for row in &mut query.values { for expr in row { expr.collect_params(&mut params)?; } }
+        Ok((query.build()?, params))
     }
 }
 
@@ -421,6 +426,13 @@ pub fn bulk_insert() -> BulkInsertBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn values_are_bound() {
+        let (sql, params) = insert_into("users").columns(["name", "age"]).values_literal(["x' OR 1=1 --", "20"]).build_with_params().unwrap();
+        assert!(sql.contains("VALUES (@P1, @P2)"));
+        assert_eq!(params, vec![SqlValue::String("x' OR 1=1 --".into()), SqlValue::String("20".into())]);
+    }
 
     #[test]
     fn test_simple_insert() {

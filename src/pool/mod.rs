@@ -11,7 +11,8 @@ use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::{debug, error, info};
 
-use crate::connection::{ConnectionConfig, MssqlConnection, MssqlRow};
+use crate::connection::{stream_to_rows, ConnectionConfig, MssqlConnection, MssqlRow};
+use tiberius::ToSql;
 use crate::error::{ConnectionError, MssqlError, MssqlResult, PoolError};
 use crate::types::SqlValue;
 
@@ -187,10 +188,9 @@ impl ManageConnection for MssqlConnectionManager {
     async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
         debug!("Checking connection validity");
 
-        conn.client
-            .simple_query(&self.test_query)
-            .await
-            .map_err(MssqlError::Driver)?;
+        use futures::TryStreamExt;
+        let mut stream = conn.client.simple_query(&self.test_query).await.map_err(MssqlError::Driver)?;
+        while stream.try_next().await.map_err(MssqlError::Driver)?.is_some() {}
 
         Ok(())
     }
@@ -321,10 +321,11 @@ pub struct PooledMssqlConnection<'a> {
 
 impl<'a> PooledMssqlConnection<'a> {
     /// Execute a query that returns rows.
-    pub async fn query(&mut self, sql: &str, _params: &[SqlValue]) -> MssqlResult<Vec<MssqlRow>> {
+    pub async fn query(&mut self, sql: &str, params: &[SqlValue]) -> MssqlResult<Vec<MssqlRow>> {
         debug!("Executing pooled query: {}", sql);
 
-        let stream = self.conn.client.query(sql, &[]).await.map_err(MssqlError::Driver)?;
+        let bindings: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
+        let stream = self.conn.client.query(sql, &bindings).await.map_err(MssqlError::Driver)?;
 
         let rows = stream_to_rows(stream).await?;
         Ok(rows)
@@ -342,10 +343,11 @@ impl<'a> PooledMssqlConnection<'a> {
     }
 
     /// Execute a non-query command.
-    pub async fn execute(&mut self, sql: &str, _params: &[SqlValue]) -> MssqlResult<u64> {
+    pub async fn execute(&mut self, sql: &str, params: &[SqlValue]) -> MssqlResult<u64> {
         debug!("Executing pooled command: {}", sql);
 
-        let result = self.conn.client.execute(sql, &[]).await.map_err(MssqlError::Driver)?;
+        let bindings: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
+        let result = self.conn.client.execute(sql, &bindings).await.map_err(MssqlError::Driver)?;
         Ok(result.total())
     }
 
@@ -353,7 +355,9 @@ impl<'a> PooledMssqlConnection<'a> {
     pub async fn execute_batch(&mut self, sql: &str) -> MssqlResult<()> {
         debug!("Executing pooled batch");
 
-        self.conn.client.simple_query(sql).await.map_err(MssqlError::Driver)?;
+        use futures::TryStreamExt;
+        let mut stream = self.conn.client.simple_query(sql).await.map_err(MssqlError::Driver)?;
+        while stream.try_next().await.map_err(MssqlError::Driver)?.is_some() {}
         Ok(())
     }
 
@@ -362,62 +366,6 @@ impl<'a> PooledMssqlConnection<'a> {
         let row = self.query_one("SELECT DB_NAME()", &[]).await?;
         row.get::<String>(0)
     }
-}
-
-// Helper function to convert query stream to rows
-async fn stream_to_rows(mut stream: tiberius::QueryStream<'_>) -> MssqlResult<Vec<MssqlRow>> {
-    use futures::TryStreamExt;
-
-    let mut rows = Vec::new();
-    let mut columns: Option<Vec<String>> = None;
-
-    while let Some(item) = stream.try_next().await.map_err(MssqlError::Driver)? {
-        match item {
-            tiberius::QueryItem::Metadata(meta) => {
-                columns = Some(
-                    meta.columns()
-                        .iter()
-                        .map(|c| c.name().to_string())
-                        .collect(),
-                );
-            }
-            tiberius::QueryItem::Row(row) => {
-                let cols = columns.clone().unwrap_or_default();
-                let values = tiberius_row_to_values(&row, cols.len())?;
-                rows.push(MssqlRow::new(cols, values));
-            }
-        }
-    }
-
-    Ok(rows)
-}
-
-fn tiberius_row_to_values(row: &tiberius::Row, column_count: usize) -> MssqlResult<Vec<SqlValue>> {
-    let mut values = Vec::with_capacity(column_count);
-
-    for i in 0..column_count {
-        let value = if let Some(v) = row.try_get::<i32, _>(i).ok().flatten() {
-            SqlValue::Int(v)
-        } else if let Some(v) = row.try_get::<i64, _>(i).ok().flatten() {
-            SqlValue::BigInt(v)
-        } else if let Some(v) = row.try_get::<bool, _>(i).ok().flatten() {
-            SqlValue::Bool(v)
-        } else if let Some(v) = row.try_get::<f32, _>(i).ok().flatten() {
-            SqlValue::Float(v)
-        } else if let Some(v) = row.try_get::<f64, _>(i).ok().flatten() {
-            SqlValue::Double(v)
-        } else if let Some(v) = row.try_get::<&str, _>(i).ok().flatten() {
-            SqlValue::String(v.to_string())
-        } else if let Some(v) = row.try_get::<uuid::Uuid, _>(i).ok().flatten() {
-            SqlValue::Uuid(v)
-        } else {
-            SqlValue::Null
-        };
-
-        values.push(value);
-    }
-
-    Ok(values)
 }
 
 /// Builder for creating connection pools.

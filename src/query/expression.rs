@@ -233,7 +233,7 @@ impl Expr {
         Expr::Raw(sql.into())
     }
 
-    /// Create a parameter placeholder.
+    /// Create a one-based parameter placeholder (e.g. 1 renders as @P1).
     pub fn param(index: usize) -> Self {
         Expr::Param(index)
     }
@@ -535,15 +535,47 @@ impl Expr {
         }
     }
 
+    /// Replace literal values with driver-compatible positional parameters.
+    pub(crate) fn collect_params(&mut self, params: &mut Vec<SqlValue>) -> crate::error::MssqlResult<()> {
+        use crate::error::{MssqlError, QueryError};
+        match self {
+            Expr::Literal(value) => {
+                params.push(value.clone());
+                *self = Expr::Param(params.len());
+            }
+            Expr::Param(_) => return Err(MssqlError::Query(QueryError::BuilderError(
+                "Explicit placeholders cannot be combined with automatic parameter extraction; use RawQuery for externally supplied parameters".into(),
+            ))),
+            Expr::Function { args, .. } => for arg in args { arg.collect_params(params)?; },
+            Expr::BinaryOp { left, right, .. } => { left.collect_params(params)?; right.collect_params(params)?; },
+            Expr::UnaryOp { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } | Expr::Aggregate { expr, .. } => expr.collect_params(params)?,
+            Expr::Case { operand, when_clauses, else_clause } => {
+                if let Some(expr) = operand { expr.collect_params(params)?; }
+                for (when, then) in when_clauses { when.collect_params(params)?; then.collect_params(params)?; }
+                if let Some(expr) = else_clause { expr.collect_params(params)?; }
+            }
+            Expr::In { expr, list, .. } => { expr.collect_params(params)?; for item in list { item.collect_params(params)?; } },
+            Expr::Between { expr, low, high, .. } => { expr.collect_params(params)?; low.collect_params(params)?; high.collect_params(params)?; },
+            Expr::Like { expr, pattern, .. } => { expr.collect_params(params)?; pattern.collect_params(params)?; },
+            Expr::Window { func, partition_by, order_by } => {
+                func.collect_params(params)?;
+                for expr in partition_by { expr.collect_params(params)?; }
+                for expr in order_by { expr.expr.collect_params(params)?; }
+            }
+            Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::Raw(_) | Expr::Subquery(_) | Expr::Exists { .. } => {}
+        }
+        Ok(())
+    }
+
     /// Render the expression to SQL.
     pub fn to_sql(&self) -> String {
         match self {
-            Expr::Column(name) => quote_identifier(name),
+            Expr::Column(name) => quote_qualified_identifier(name),
             Expr::QualifiedColumn { table, column } => {
                 format!("{}.{}", quote_identifier(table), quote_identifier(column))
             }
             Expr::Literal(value) => value.to_string(),
-            Expr::Param(index) => format!("@p{}", index),
+            Expr::Param(index) => format!("@P{}", index),
             Expr::Raw(sql) => sql.clone(),
             Expr::Function { name, args } => {
                 let args_sql: Vec<String> = args.iter().map(|a| a.to_sql()).collect();
@@ -730,6 +762,11 @@ impl From<SqlValue> for Expr {
 pub fn quote_identifier(name: &str) -> String {
     // Always quote identifiers in SQL Server for safety
     format!("[{}]", name.replace(']', "]]"))
+}
+
+/// Quote each part of a dot-qualified identifier.
+pub fn quote_qualified_identifier(name: &str) -> String {
+    name.split('.').map(quote_identifier).collect::<Vec<_>>().join(".")
 }
 
 /// Check if a word is a SQL Server reserved word.

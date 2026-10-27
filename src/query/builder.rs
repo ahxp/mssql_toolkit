@@ -244,9 +244,9 @@ impl ParamCollector {
 
     /// Add a parameter and return its placeholder.
     pub fn add(&mut self, value: SqlValue) -> String {
-        let index = self.params.len();
+        let index = self.params.len() + 1;
         self.params.push(value);
-        format!("@p{}", index)
+        format!("@P{}", index)
     }
 
     /// Get all collected parameters.

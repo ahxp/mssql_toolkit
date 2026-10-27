@@ -45,7 +45,7 @@ async fn main() -> MssqlResult<()> {
     println!("\n--- Parameterized Query ---");
     let rows = conn
         .query(
-            "SELECT TOP 5 name, create_date FROM sys.databases WHERE name LIKE @p0",
+            "SELECT TOP 5 name, create_date FROM sys.databases WHERE name LIKE @P1",
             &[SqlValue::String("%master%".to_string())],
         )
         .await?;

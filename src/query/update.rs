@@ -335,7 +335,13 @@ impl QueryBuilder for UpdateBuilder {
     }
 
     fn build_with_params(&self) -> MssqlResult<(String, Vec<SqlValue>)> {
-        Ok((self.build()?, Vec::new()))
+        let mut query = self.clone();
+        let mut params = Vec::new();
+        for set in &mut query.sets { set.value.collect_params(&mut params)?; }
+        for output in &mut query.output { if let OutputColumn::Expression { expr, .. } = output { expr.collect_params(&mut params)?; } }
+        for join in &mut query.joins { if let Some(expr) = &mut join.condition { expr.collect_params(&mut params)?; } }
+        if let Some(expr) = &mut query.where_clause { expr.collect_params(&mut params)?; }
+        Ok((query.build()?, params))
     }
 }
 
@@ -352,6 +358,14 @@ pub fn update_table(table: impl Into<String>) -> UpdateBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_and_condition_values_are_bound() {
+        let (sql, params) = update_table("users").set_literal("name", "O'Brien").where_clause(col("id").eq(9)).build_with_params().unwrap();
+        assert!(sql.contains("[name] = @P1"));
+        assert!(sql.contains("[id] = @P2"));
+        assert_eq!(params, vec![SqlValue::String("O'Brien".into()), SqlValue::Int(9)]);
+    }
 
     #[test]
     fn test_simple_update() {

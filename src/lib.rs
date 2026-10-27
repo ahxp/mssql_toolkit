@@ -35,7 +35,7 @@
 //!     ).await?;
 //!
 //!     // Execute a query
-//!     let rows = conn.query("SELECT * FROM users WHERE active = @p0", &[SqlValue::Bool(true)]).await?;
+//!     let rows = conn.query("SELECT * FROM users WHERE active = @P1", &[SqlValue::Bool(true)]).await?;
 //!
 //!     for row in rows {
 //!         let name: String = row.get(1)?;

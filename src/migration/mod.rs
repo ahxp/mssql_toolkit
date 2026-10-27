@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::connection::MssqlConnection;
 use crate::error::{MigrationError, MssqlError, MssqlResult};
+use crate::transaction::TransactionExt;
 
 /// A database migration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,7 +132,7 @@ impl<'a> MigrationRunner<'a> {
 
     /// Get the full table name.
     fn full_table_name(&self) -> String {
-        format!("[{}].[{}]", self.schema, self.table_name)
+        format!("[{}].[{}]", self.schema.replace(']', "]]"), self.table_name.replace(']', "]]"))
     }
 
     /// Ensure the migrations table exists.
@@ -140,7 +141,7 @@ impl<'a> MigrationRunner<'a> {
             r#"
 IF NOT EXISTS (SELECT 1 FROM sys.tables t
                JOIN sys.schemas s ON t.schema_id = s.schema_id
-               WHERE t.name = '{}' AND s.name = '{}')
+               WHERE t.name = N'{}' AND s.name = N'{}')
 BEGIN
     CREATE TABLE {} (
         version NVARCHAR(255) NOT NULL PRIMARY KEY,
@@ -151,8 +152,8 @@ BEGIN
     );
 END
 "#,
-            self.table_name,
-            self.schema,
+            self.table_name.replace('\'', "''"),
+            self.schema.replace('\'', "''"),
             self.full_table_name()
         );
 
@@ -166,7 +167,7 @@ END
         self.ensure_table().await?;
 
         let sql = format!(
-            "SELECT version, name, checksum, applied_at, execution_time_ms FROM {} ORDER BY version",
+            "SELECT version, name, checksum, CONVERT(varchar(33), applied_at, 126), execution_time_ms FROM {} ORDER BY applied_at, version",
             self.full_table_name()
         );
 
@@ -179,8 +180,10 @@ END
                     version: row.get::<String>(0)?,
                     name: row.get::<String>(1)?,
                     checksum: row.get::<String>(2)?,
-                    applied_at: Utc::now(), // Simplified; would need proper DateTime parsing
-                    execution_time_ms: row.get::<i64>(4).unwrap_or(0),
+                    applied_at: chrono::NaiveDateTime::parse_from_str(
+                        &row.get::<String>(3)?, "%Y-%m-%dT%H:%M:%S%.f"
+                    ).map_err(|e| MssqlError::Other(format!("Invalid migration timestamp: {e}")))?.and_utc(),
+                    execution_time_ms: row.get::<i64>(4)?,
                 })
             })
             .collect::<MssqlResult<Vec<_>>>()?;
@@ -194,11 +197,12 @@ END
         let applied_versions: std::collections::HashSet<_> =
             applied.iter().map(|r| r.version.as_str()).collect();
 
-        let pending: Vec<_> = self
+        let mut pending: Vec<_> = self
             .migrations
             .iter()
             .filter(|m| !applied_versions.contains(m.version.as_str()))
             .collect();
+        pending.sort_by(|a, b| a.version.cmp(&b.version));
 
         Ok(pending)
     }
@@ -220,50 +224,23 @@ END
             info!("Running migration: {} - {}", migration.version, migration.name);
 
             let start = std::time::Instant::now();
-
-            // Execute the migration
-            if migration.transactional {
-                self.connection
-                    .execute_batch(&format!(
-                        "BEGIN TRANSACTION; {} COMMIT TRANSACTION;",
-                        migration.up_sql
-                    ))
-                    .await
-                    .map_err(|e| {
-                        error!("Migration {} failed: {}", migration.version, e);
-                        MssqlError::Migration(MigrationError::Failed {
-                            version: migration.version.clone(),
-                            reason: e.to_string(),
-                        })
-                    })?;
-            } else {
-                self.connection.execute_batch(&migration.up_sql).await.map_err(|e| {
-                    error!("Migration {} failed: {}", migration.version, e);
-                    MssqlError::Migration(MigrationError::Failed {
-                        version: migration.version.clone(),
-                        reason: e.to_string(),
-                    })
-                })?;
-            }
-
-            let execution_time = start.elapsed().as_millis() as i64;
-
-            // Record the migration
-            let record_sql = format!(
-                "INSERT INTO {} (version, name, checksum, execution_time_ms) VALUES ('{}', '{}', '{}', {})",
+            let history = |elapsed_ms: u128| format!(
+                "INSERT INTO {} (version, name, checksum, execution_time_ms) VALUES (N'{}', N'{}', N'{}', {})",
                 self.full_table_name(),
                 migration.version.replace('\'', "''"),
                 migration.name.replace('\'', "''"),
-                migration.checksum,
-                execution_time
+                migration.checksum.replace('\'', "''"),
+                elapsed_ms.min(i64::MAX as u128),
             );
+            self.execute_migration_batch(&migration.up_sql, history, migration.transactional).await.map_err(|e| {
+                error!("Migration {} failed: {}", migration.version, e);
+                MssqlError::Migration(MigrationError::Failed {
+                    version: migration.version.clone(),
+                    reason: e.to_string(),
+                })
+            })?;
 
-            self.connection.execute_batch(&record_sql).await?;
-
-            info!(
-                "Migration {} completed in {}ms",
-                migration.version, execution_time
-            );
+            info!("Migration {} completed in {}ms", migration.version, start.elapsed().as_millis());
             applied.push(migration.version.clone());
         }
 
@@ -306,28 +283,40 @@ END
 
             info!("Rolling back migration: {} - {}", record.version, record.name);
 
-            // Execute the down migration
-            if migration.transactional {
-                self.connection
-                    .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT TRANSACTION;", down_sql))
-                    .await?;
-            } else {
-                self.connection.execute_batch(down_sql).await?;
-            }
-
-            // Remove the migration record
+            // Remove the history record in the same transaction as the down SQL.
             let delete_sql = format!(
-                "DELETE FROM {} WHERE version = '{}'",
+                "DELETE FROM {} WHERE version = N'{}'",
                 self.full_table_name(),
                 record.version.replace('\'', "''")
             );
-            self.connection.execute_batch(&delete_sql).await?;
+            self.execute_migration_batch(down_sql, |_| delete_sql, migration.transactional).await?;
 
             info!("Migration {} rolled back", record.version);
             rolled_back.push(record.version.clone());
         }
 
         Ok(rolled_back)
+    }
+
+    async fn execute_migration_batch<F>(&self, sql: &str, history: F, transactional: bool) -> MssqlResult<()>
+    where F: FnOnce(u128) -> String {
+        let start = std::time::Instant::now();
+        if !transactional {
+            self.connection.execute_batch(sql).await?;
+            return self.connection.execute_batch(&history(start.elapsed().as_millis())).await;
+        }
+        let transaction = self.connection.begin_transaction().await?;
+        let result = match transaction.execute_batch(sql).await {
+            Ok(()) => transaction.execute_batch(&history(start.elapsed().as_millis())).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            if let Err(rollback_error) = transaction.rollback().await {
+                return Err(MssqlError::Other(format!("Migration failed: {error}; rollback failed: {rollback_error}")));
+            }
+            return Err(error);
+        }
+        transaction.commit().await
     }
 
     /// Rollback to a specific version.
@@ -416,6 +405,7 @@ pub fn load_migrations_from_dir(dir: &Path) -> MssqlResult<Vec<Migration>> {
     }
 
     let mut migrations = Vec::new();
+    let mut down_files = Vec::new();
 
     let mut entries: Vec<_> = fs::read_dir(dir)
         .map_err(|e| MssqlError::Io(e))?
@@ -454,18 +444,28 @@ pub fn load_migrations_from_dir(dir: &Path) -> MssqlResult<Vec<Migration>> {
         let content = fs::read_to_string(&path).map_err(|e| MssqlError::Io(e))?;
 
         if is_down {
-            // Find existing migration and add down SQL
-            if let Some(m) = migrations.iter_mut().find(|m: &&mut Migration| m.version == version) {
-                m.down_sql = Some(content);
-            }
+            down_files.push((version, name, content));
         } else {
             // Check if migration already exists (for down file pairing)
-            if let Some(_m) = migrations.iter_mut().find(|m: &&mut Migration| m.version == version) {
-                // Migration exists, this shouldn't happen for up files
-                warn!("Duplicate migration version: {}", version);
+            if migrations.iter().any(|m: &Migration| m.version == version) {
+                return Err(MssqlError::Migration(MigrationError::InvalidFormat(
+                    format!("Duplicate migration version: {version}")
+                )));
             } else {
                 migrations.push(Migration::new(version, name, content));
             }
+        }
+    }
+
+    for (version, name, content) in down_files {
+        let migration = migrations.iter_mut().find(|m| m.version == version && m.name == name)
+            .ok_or_else(|| MssqlError::Migration(MigrationError::InvalidFormat(
+                format!("Down migration {version}_{name} has no matching up migration")
+            )))?;
+        if migration.down_sql.replace(content).is_some() {
+            return Err(MssqlError::Migration(MigrationError::InvalidFormat(
+                format!("Duplicate down migration for {version}_{name}")
+            )));
         }
     }
 
@@ -567,6 +567,28 @@ pub fn generate_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairs_down_file_even_when_it_sorts_first() {
+        let dir = std::env::temp_dir().join(format!("mssql-migration-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("001_users.up.sql"), "CREATE TABLE users (id INT)").unwrap();
+        std::fs::write(dir.join("001_users.down.sql"), "DROP TABLE users").unwrap();
+        let migrations = load_migrations_from_dir(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations[0].down_sql.as_deref(), Some("DROP TABLE users"));
+    }
+
+    #[test]
+    fn orphan_down_file_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("mssql-migration-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("001_users.down.sql"), "DROP TABLE users").unwrap();
+        let result = load_migrations_from_dir(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_migration_checksum() {

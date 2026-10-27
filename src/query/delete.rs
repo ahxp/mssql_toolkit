@@ -249,7 +249,12 @@ impl QueryBuilder for DeleteBuilder {
     }
 
     fn build_with_params(&self) -> MssqlResult<(String, Vec<SqlValue>)> {
-        Ok((self.build()?, Vec::new()))
+        let mut query = self.clone();
+        let mut params = Vec::new();
+        for output in &mut query.output { if let OutputColumn::Expression { expr, .. } = output { expr.collect_params(&mut params)?; } }
+        for join in &mut query.joins { if let Some(expr) = &mut join.condition { expr.collect_params(&mut params)?; } }
+        if let Some(expr) = &mut query.where_clause { expr.collect_params(&mut params)?; }
+        Ok((query.build()?, params))
     }
 }
 
@@ -323,6 +328,13 @@ pub fn truncate_table(table: impl Into<String>) -> TruncateBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn condition_values_are_bound() {
+        let (sql, params) = delete_from("users").where_clause(col("id").eq(9)).build_with_params().unwrap();
+        assert!(sql.contains("[id] = @P1"));
+        assert_eq!(params, vec![SqlValue::Int(9)]);
+    }
 
     #[test]
     fn test_simple_delete() {

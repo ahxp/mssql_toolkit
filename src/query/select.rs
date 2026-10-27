@@ -467,6 +467,25 @@ impl SelectBuilder {
     }
 }
 
+impl SelectBuilder {
+    pub(crate) fn collect_params(&mut self, params: &mut Vec<SqlValue>) -> MssqlResult<()> {
+        for column in &mut self.columns {
+            match column {
+                SelectColumn::Expr(expr) => expr.collect_params(params)?,
+                SelectColumn::Aliased(aliased) => aliased.expr.collect_params(params)?,
+                _ => {}
+            }
+        }
+        for join in &mut self.joins { if let Some(expr) = &mut join.condition { expr.collect_params(params)?; } }
+        if let Some(expr) = &mut self.where_clause { expr.collect_params(params)?; }
+        for expr in &mut self.group_by { expr.collect_params(params)?; }
+        if let Some(expr) = &mut self.having { expr.collect_params(params)?; }
+        for union in &mut self.unions { union.query.collect_params(params)?; }
+        for order in &mut self.order_by { order.expr.collect_params(params)?; }
+        Ok(())
+    }
+}
+
 impl QueryBuilder for SelectBuilder {
     fn build(&self) -> MssqlResult<String> {
         let mut sql = String::new();
@@ -601,9 +620,10 @@ impl QueryBuilder for SelectBuilder {
     }
 
     fn build_with_params(&self) -> MssqlResult<(String, Vec<SqlValue>)> {
-        // For now, return the SQL without parameter extraction
-        // A full implementation would walk the expression tree and extract parameters
-        Ok((self.build()?, Vec::new()))
+        let mut query = self.clone();
+        let mut params = Vec::new();
+        query.collect_params(&mut params)?;
+        Ok((query.build()?, params))
     }
 }
 
@@ -629,6 +649,27 @@ pub fn select_all() -> SelectBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameterized_nested_query_keeps_values_and_indices() {
+        let sub = select().select(["u.id"]).from("users").where_clause(col("u.kind").eq("member"));
+        let query = select().select(["u.id"]).from("users")
+            .where_clause(col("u.age").ge(18).and(col("u.name").eq("O'Brien")))
+            .union_all(sub);
+        let (sql, params) = query.build_with_params().unwrap();
+        assert_eq!(params, vec![SqlValue::Int(18), SqlValue::String("O'Brien".into()), SqlValue::String("member".into())]);
+        assert!(sql.contains("[u].[id]"));
+        assert!(sql.contains("[u].[age] >= @P1"));
+        assert!(sql.contains("[u].[name] = @P2"));
+        assert!(sql.contains("[u].[kind] = @P3"));
+        assert!(!sql.contains("O'Brien"));
+    }
+
+    #[test]
+    fn explicit_placeholders_are_rejected_by_automatic_extraction() {
+        let query = select().from("users").where_clause(col("id").eq(Expr::param(1)));
+        assert!(query.build_with_params().is_err());
+    }
 
     #[test]
     fn test_simple_select() {

@@ -4,10 +4,15 @@
 //! isolation levels, and nested transactions.
 
 use async_trait::async_trait;
+use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::net::TcpStream;
+use tokio_util::compat::Compat;
+use tiberius::Client;
 use tracing::{debug, error, info};
 
-use crate::connection::{MssqlConnection, MssqlRow};
-use crate::error::{MssqlError, MssqlResult, TransactionError};
+use crate::connection::{batch_on_client, execute_on_client, query_on_client, MssqlConnection, MssqlRow};
+use crate::error::{ConnectionError, MssqlError, MssqlResult, TransactionError};
+use crate::query::expression::quote_identifier;
 use crate::types::SqlValue;
 
 /// Transaction isolation levels.
@@ -65,8 +70,16 @@ pub enum TransactionState {
 }
 
 /// A database transaction.
+///
+/// The originating connection is held exclusively until this transaction is
+/// committed or rolled back. Use the transaction methods while it is active;
+/// separate operations on the connection wait for the transaction to finish.
+/// Dropping an active transaction closes the connection so that SQL Server
+/// rolls it back. Reconnect before using the connection again in that case.
 pub struct Transaction<'a> {
     connection: &'a MssqlConnection,
+    // Keep the underlying connection exclusively locked for the entire transaction.
+    client: Mutex<Option<OwnedMutexGuard<Option<Client<Compat<TcpStream>>>>>>,
     state: TransactionState,
     isolation_level: IsolationLevel,
     savepoints: Vec<String>,
@@ -78,6 +91,7 @@ impl<'a> Transaction<'a> {
     pub(crate) fn new(connection: &'a MssqlConnection) -> Self {
         Self {
             connection,
+            client: Mutex::new(None),
             state: TransactionState::NotStarted,
             isolation_level: IsolationLevel::default(),
             savepoints: Vec::new(),
@@ -105,17 +119,22 @@ impl<'a> Transaction<'a> {
 
         debug!("Beginning transaction with isolation level: {}", self.isolation_level);
 
-        // Set isolation level
-        self.connection
-            .execute_batch(self.isolation_level.to_sql())
-            .await?;
+        let guard = self.connection.client.clone().lock_owned().await;
+        if guard.is_none() {
+            return Err(MssqlError::Connection(ConnectionError::ConnectionClosed));
+        }
+        *self.client.get_mut() = Some(guard);
+        // If initialization or any subsequent operation is cancelled, Drop closes
+        // the socket so SQL Server rolls back any possibly active transaction.
+        self.state = TransactionState::Active;
+        self.batch(self.isolation_level.to_sql()).await?;
 
         // Begin transaction
         let begin_sql = match &self.name {
-            Some(name) => format!("BEGIN TRANSACTION [{}]", name),
+            Some(name) => format!("BEGIN TRANSACTION {}", quote_identifier(name)),
             None => "BEGIN TRANSACTION".to_string(),
         };
-        self.connection.execute_batch(&begin_sql).await?;
+        self.batch(&begin_sql).await?;
 
         self.state = TransactionState::Active;
         info!("Transaction started");
@@ -132,11 +151,11 @@ impl<'a> Transaction<'a> {
         debug!("Committing transaction");
 
         let commit_sql = match &self.name {
-            Some(name) => format!("COMMIT TRANSACTION [{}]", name),
+            Some(name) => format!("COMMIT TRANSACTION {}", quote_identifier(name)),
             None => "COMMIT TRANSACTION".to_string(),
         };
 
-        match self.connection.execute_batch(&commit_sql).await {
+        match self.batch(&commit_sql).await {
             Ok(_) => {
                 self.state = TransactionState::Committed;
                 info!("Transaction committed");
@@ -144,7 +163,6 @@ impl<'a> Transaction<'a> {
             }
             Err(e) => {
                 error!("Transaction commit failed: {}", e);
-                self.state = TransactionState::RolledBack;
                 Err(MssqlError::Transaction(TransactionError::CommitFailed(
                     e.to_string(),
                 )))
@@ -161,11 +179,11 @@ impl<'a> Transaction<'a> {
         debug!("Rolling back transaction");
 
         let rollback_sql = match &self.name {
-            Some(name) => format!("ROLLBACK TRANSACTION [{}]", name),
+            Some(name) => format!("ROLLBACK TRANSACTION {}", quote_identifier(name)),
             None => "ROLLBACK TRANSACTION".to_string(),
         };
 
-        self.connection.execute_batch(&rollback_sql).await?;
+        self.batch(&rollback_sql).await?;
         self.state = TransactionState::RolledBack;
         info!("Transaction rolled back");
 
@@ -181,8 +199,8 @@ impl<'a> Transaction<'a> {
         let name = name.into();
         debug!("Creating savepoint: {}", name);
 
-        self.connection
-            .execute_batch(&format!("SAVE TRANSACTION [{}]", name))
+        self
+            .batch(&format!("SAVE TRANSACTION {}", quote_identifier(&name)))
             .await?;
 
         self.savepoints.push(name.clone());
@@ -205,8 +223,8 @@ impl<'a> Transaction<'a> {
 
         debug!("Rolling back to savepoint: {}", name);
 
-        self.connection
-            .execute_batch(&format!("ROLLBACK TRANSACTION [{}]", name))
+        self
+            .batch(&format!("ROLLBACK TRANSACTION {}", quote_identifier(name)))
             .await?;
 
         // Remove all savepoints after this one
@@ -237,7 +255,10 @@ impl<'a> Transaction<'a> {
         if self.state != TransactionState::Active {
             return Err(MssqlError::Transaction(TransactionError::NotStarted));
         }
-        self.connection.query(sql, params).await
+        let mut guard = self.client.lock().await;
+        let client = guard.as_mut().and_then(|g| g.as_mut())
+            .ok_or(MssqlError::Connection(ConnectionError::ConnectionClosed))?;
+        query_on_client(client, sql, params).await
     }
 
     /// Execute a non-query command within the transaction.
@@ -245,7 +266,10 @@ impl<'a> Transaction<'a> {
         if self.state != TransactionState::Active {
             return Err(MssqlError::Transaction(TransactionError::NotStarted));
         }
-        self.connection.execute(sql, params).await
+        let mut guard = self.client.lock().await;
+        let client = guard.as_mut().and_then(|g| g.as_mut())
+            .ok_or(MssqlError::Connection(ConnectionError::ConnectionClosed))?;
+        execute_on_client(client, sql, params).await
     }
 
     /// Execute a batch of SQL within the transaction.
@@ -253,7 +277,14 @@ impl<'a> Transaction<'a> {
         if self.state != TransactionState::Active {
             return Err(MssqlError::Transaction(TransactionError::NotStarted));
         }
-        self.connection.execute_batch(sql).await
+        self.batch(sql).await
+    }
+
+    async fn batch(&self, sql: &str) -> MssqlResult<()> {
+        let mut guard = self.client.lock().await;
+        let client = guard.as_mut().and_then(|g| g.as_mut())
+            .ok_or(MssqlError::Connection(ConnectionError::ConnectionClosed))?;
+        batch_on_client(client, sql).await
     }
 
     /// Get the current transaction state.
@@ -275,13 +306,12 @@ impl<'a> Transaction<'a> {
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
         if self.state == TransactionState::Active {
-            // Transaction was not properly committed or rolled back
-            // In a real implementation, we'd want to rollback here,
-            // but we can't do async operations in drop
-            error!(
-                "Transaction dropped while still active. \
-                 You should explicitly commit or rollback transactions."
-            );
+            // Dropping the socket forces SQL Server to abort the transaction. It
+            // also prevents a dirty connection from being reused after cancellation.
+            if let Some(mut guard) = self.client.get_mut().take() {
+                guard.take();
+            }
+            error!("Active transaction dropped; connection closed to roll it back");
         }
     }
 }
@@ -289,7 +319,8 @@ impl<'a> Drop for Transaction<'a> {
 /// Extension trait to add transaction support to connections.
 #[async_trait]
 pub trait TransactionExt {
-    /// Begin a new transaction.
+    /// Begin a new transaction, exclusively holding this connection until it
+    /// commits, rolls back, or is dropped.
     async fn begin_transaction(&self) -> MssqlResult<Transaction<'_>>;
 
     /// Begin a transaction with a specific isolation level.

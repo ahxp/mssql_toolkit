@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Configuration for connecting to an MSSQL database.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     /// Server hostname or IP address.
     pub host: String,
@@ -49,6 +49,27 @@ pub struct ConnectionConfig {
 
     /// Authentication mode.
     pub auth_mode: AuthMode,
+}
+
+impl std::fmt::Debug for ConnectionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("application_name", &self.application_name)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("command_timeout", &self.command_timeout)
+            .field("encrypt", &self.encrypt)
+            .field("trust_server_certificate", &self.trust_server_certificate)
+            .field("instance", &self.instance)
+            .field("packet_size", &self.packet_size)
+            .field("mars", &self.mars)
+            .field("auth_mode", &self.auth_mode)
+            .finish()
+    }
 }
 
 /// Encryption mode for the connection.
@@ -564,6 +585,14 @@ impl ConnectionConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_password() {
+        let config = ConnectionConfig::new("localhost", "testdb").password("secret-value");
+        let output = format!("{config:?}");
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("secret-value"));
+    }
 
     #[test]
     fn test_connection_string_parsing() {

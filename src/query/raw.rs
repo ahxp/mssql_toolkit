@@ -4,6 +4,7 @@ use crate::error::MssqlResult;
 use crate::types::SqlValue;
 
 use super::builder::QueryBuilder;
+use super::expression::{Expr, quote_qualified_identifier};
 
 /// A raw SQL query with parameter support.
 #[derive(Debug, Clone)]
@@ -79,8 +80,8 @@ impl SqlFragment {
 
     /// Append a parameterized value.
     pub fn value<V: Into<SqlValue>>(mut self, value: V) -> Self {
-        let index = self.params.len();
-        self.parts.push(format!("@p{}", index));
+        let index = self.params.len() + 1;
+        self.parts.push(format!("@P{}", index));
         self.params.push(value.into());
         self
     }
@@ -90,9 +91,9 @@ impl SqlFragment {
         let offset = self.params.len();
         // Rewrite parameter references in the other fragment
         for part in other.parts {
-            if part.starts_with("@p") {
+            if part.starts_with("@P") {
                 if let Ok(idx) = part[2..].parse::<usize>() {
-                    self.parts.push(format!("@p{}", idx + offset));
+                    self.parts.push(format!("@P{}", idx + offset));
                 } else {
                     self.parts.push(part);
                 }
@@ -131,11 +132,10 @@ impl SqlFragment {
         let values: Vec<SqlValue> = values.into_iter().map(|v| v.into()).collect();
         let offset = self.params.len();
 
-        let placeholders: Vec<String> = (0..values.len())
-            .map(|i| format!("@p{}", offset + i))
-            .collect();
-
-        self.parts.push(placeholders.join(separator));
+        for i in 0..values.len() {
+            if i > 0 { self.parts.push(separator.to_string()); }
+            self.parts.push(format!("@P{}", offset + i + 1));
+        }
         self.params.extend(values);
         self
     }
@@ -198,10 +198,10 @@ impl SqlTemplate {
         let mut sql = self.template.clone();
         let mut params = Vec::new();
 
-        // Find all {name} patterns and replace with @pN
+        // Find all {name} patterns and replace with @PN
         for (name, value) in &self.named_params {
             let placeholder = format!("{{{}}}", name);
-            let param_ref = format!("@p{}", params.len());
+            let param_ref = format!("@P{}", params.len() + 1);
             sql = sql.replace(&placeholder, &param_ref);
             params.push(value.clone());
         }
@@ -219,7 +219,7 @@ pub fn template(sql: impl Into<String>) -> SqlTemplate {
 #[derive(Debug, Clone)]
 pub struct ConditionalBuilder {
     base: String,
-    conditions: Vec<String>,
+    conditions: Vec<Expr>,
     order_by: Option<String>,
     pagination: Option<(u64, u64)>,
 }
@@ -236,60 +236,42 @@ impl ConditionalBuilder {
     }
 
     /// Add a condition if the value is Some.
-    pub fn where_if<V: std::fmt::Display>(mut self, column: &str, value: Option<V>) -> Self {
-        if let Some(v) = value {
-            self.conditions.push(format!("{} = '{}'", column, v));
-        }
+    pub fn where_if<V: Into<SqlValue>>(mut self, column: &str, value: Option<V>) -> Self {
+        if let Some(value) = value { self.conditions.push(Expr::col(column).eq(Expr::lit(value))); }
         self
     }
 
-    /// Add a LIKE condition if the value is Some.
+    /// Add a LIKE condition if the pattern is present.
     pub fn like_if(mut self, column: &str, pattern: Option<&str>) -> Self {
-        if let Some(p) = pattern {
-            self.conditions.push(format!("{} LIKE '{}'", column, p.replace('\'', "''")));
-        }
+        if let Some(value) = pattern { self.conditions.push(Expr::col(column).like(Expr::lit(value))); }
         self
     }
 
-    /// Add a range condition if both values are Some.
-    pub fn between_if<V: std::fmt::Display>(
-        mut self,
-        column: &str,
-        min: Option<V>,
-        max: Option<V>,
-    ) -> Self {
-        match (min, max) {
-            (Some(mi), Some(ma)) => {
-                self.conditions.push(format!("{} BETWEEN '{}' AND '{}'", column, mi, ma));
-            }
-            (Some(mi), None) => {
-                self.conditions.push(format!("{} >= '{}'", column, mi));
-            }
-            (None, Some(ma)) => {
-                self.conditions.push(format!("{} <= '{}'", column, ma));
-            }
-            (None, None) => {}
-        }
+    /// Add a range condition for the bounds supplied.
+    pub fn between_if<V: Into<SqlValue>>(mut self, column: &str, min: Option<V>, max: Option<V>) -> Self {
+        let column = Expr::col(column);
+        let condition = match (min, max) {
+            (Some(min), Some(max)) => Some(column.between(Expr::lit(min), Expr::lit(max))),
+            (Some(min), None) => Some(column.ge(Expr::lit(min))),
+            (None, Some(max)) => Some(column.le(Expr::lit(max))),
+            (None, None) => None,
+        };
+        if let Some(condition) = condition { self.conditions.push(condition); }
         self
     }
 
     /// Add an IN condition if the list is not empty.
     pub fn in_if<I, V>(mut self, column: &str, values: I) -> Self
-    where
-        I: IntoIterator<Item = V>,
-        V: std::fmt::Display,
-    {
-        let vals: Vec<String> = values.into_iter().map(|v| format!("'{}'", v)).collect();
-        if !vals.is_empty() {
-            self.conditions.push(format!("{} IN ({})", column, vals.join(", ")));
-        }
+    where I: IntoIterator<Item = V>, V: Into<SqlValue> {
+        let values: Vec<Expr> = values.into_iter().map(Expr::lit).collect();
+        if !values.is_empty() { self.conditions.push(Expr::col(column).in_list(values)); }
         self
     }
 
-    /// Set ORDER BY clause.
+    /// Set ORDER BY clause using a column identifier.
     pub fn order_by(mut self, column: &str, desc: bool) -> Self {
         let dir = if desc { "DESC" } else { "ASC" };
-        self.order_by = Some(format!("ORDER BY {} {}", column, dir));
+        self.order_by = Some(format!("ORDER BY {} {}", quote_qualified_identifier(column), dir));
         self
     }
 
@@ -297,6 +279,14 @@ impl ConditionalBuilder {
     pub fn paginate(mut self, page: u64, page_size: u64) -> Self {
         self.pagination = Some((page * page_size, page_size));
         self
+    }
+
+    /// Build SQL and the values to bind. Prefer this for user-provided values.
+    pub fn build_with_params(&self) -> MssqlResult<(String, Vec<SqlValue>)> {
+        let mut query = self.clone();
+        let mut params = Vec::new();
+        for condition in &mut query.conditions { condition.collect_params(&mut params)?; }
+        Ok((query.build(), params))
     }
 
     /// Build the final query.
@@ -309,7 +299,7 @@ impl ConditionalBuilder {
             } else {
                 sql.push_str(" WHERE ");
             }
-            sql.push_str(&self.conditions.join(" AND "));
+            sql.push_str(&self.conditions.iter().map(Expr::to_sql).collect::<Vec<_>>().join(" AND "));
         }
 
         if let Some(ref order) = self.order_by {
@@ -339,13 +329,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn conditional_binds_untrusted_values_and_quotes_identifiers() {
+        let input = "x' OR 1=1 --";
+        let query = conditional("SELECT * FROM users")
+            .where_if("u.na]me", Some(input))
+            .between_if("u.age", Some(18), Some(30))
+            .in_if("u.role", ["admin", "user"])
+            .order_by("u.name", false);
+        let (sql, params) = query.build_with_params().unwrap();
+        assert_eq!(sql, "SELECT * FROM users WHERE ([u].[na]]me] = @P1) AND [u].[age] BETWEEN @P2 AND @P3 AND [u].[role] IN (@P4, @P5) ORDER BY [u].[name] ASC");
+        assert_eq!(params, vec![SqlValue::String(input.into()), SqlValue::Int(18), SqlValue::Int(30), SqlValue::String("admin".into()), SqlValue::String("user".into())]);
+        assert!(!sql.contains(input));
+        assert!(query.build().contains("x'' OR 1=1 --"));
+    }
+
+    #[test]
+    fn composing_fragments_offsets_all_generated_placeholders() {
+        let f = fragment().value(10).sql(" IN (").fragment(fragment().join_values([1, 2], ", ")).sql(")");
+        let (sql, params) = f.build_with_params();
+        assert_eq!(sql, "@P1 IN (@P2, @P3)");
+        assert_eq!(params, vec![10.into(), 1.into(), 2.into()]);
+    }
+
+    #[test]
     fn test_raw_query() {
-        let query = raw_sql("SELECT * FROM users WHERE id = @p0")
+        let query = raw_sql("SELECT * FROM users WHERE id = @P1")
             .param(1)
             .build_with_params()
             .unwrap();
 
-        assert_eq!(query.0, "SELECT * FROM users WHERE id = @p0");
+        assert_eq!(query.0, "SELECT * FROM users WHERE id = @P1");
         assert_eq!(query.1.len(), 1);
     }
 
@@ -358,8 +371,8 @@ mod tests {
             .value("active");
 
         let (sql, params) = frag.build_with_params();
-        assert!(sql.contains("@p0"));
-        assert!(sql.contains("@p1"));
+        assert!(sql.contains("@P1"));
+        assert!(sql.contains("@P2"));
         assert_eq!(params.len(), 2);
     }
 
@@ -371,7 +384,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert!(sql.contains("@p"));
+        assert!(sql.contains("@P"));
         assert_eq!(params.len(), 2);
     }
 
@@ -385,7 +398,7 @@ mod tests {
             .build();
 
         assert!(query.contains("WHERE"));
-        assert!(query.contains("category = 'electronics'"));
+        assert!(query.contains("[category] = 'electronics'"));
         assert!(query.contains("BETWEEN"));
         assert!(query.contains("ORDER BY"));
         assert!(query.contains("OFFSET"));
