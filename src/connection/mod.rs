@@ -18,6 +18,33 @@ pub use config::{AuthMode, ConnectionConfig, ConnectionConfigBuilder, Encryption
 use crate::error::{ConnectionError, MssqlError, MssqlResult, QueryError};
 use crate::types::SqlValue;
 
+/// Bind values using TDS parameters instead of interpolating SQL literals.
+pub(crate) fn bind_query(sql: &str, params: &[SqlValue]) -> tiberius::Query<'_> {
+    let mut query = tiberius::Query::new(sql);
+    for param in params {
+        match param {
+            SqlValue::Null => query.bind(Option::<&str>::None),
+            SqlValue::Bool(v) => query.bind(*v),
+            SqlValue::TinyInt(v) => query.bind(*v),
+            SqlValue::SmallInt(v) => query.bind(*v),
+            SqlValue::Int(v) => query.bind(*v),
+            SqlValue::BigInt(v) => query.bind(*v),
+            SqlValue::Float(v) => query.bind(*v),
+            SqlValue::Double(v) => query.bind(*v),
+            SqlValue::Decimal(v) => query.bind(*v),
+            SqlValue::String(v) => query.bind(v.as_str()),
+            SqlValue::Binary(v) => query.bind(v.as_slice()),
+            SqlValue::Date(v) => query.bind(*v),
+            SqlValue::Time(v) => query.bind(*v),
+            SqlValue::DateTime(v) => query.bind(*v),
+            SqlValue::DateTimeUtc(v) => query.bind(*v),
+            SqlValue::Uuid(v) => query.bind(*v),
+            SqlValue::Json(v) => query.bind(v.to_string()),
+        }
+    }
+    query
+}
+
 /// Represents a connection to an MSSQL database.
 pub struct MssqlConnection {
     client: Arc<Mutex<Client<Compat<TcpStream>>>>,
@@ -111,9 +138,7 @@ impl MssqlConnection {
 
         debug!("Executing query with {} parameters", params.len());
 
-        // For now, we only support parameterless queries
-        // Parameterized queries require more complex handling
-        let stream = client.query(sql, &[]).await;
+        let stream = bind_query(sql, params).query(&mut *client).await;
 
         let stream = stream.map_err(|e| {
             error!("Query execution failed: {}", e);
@@ -160,8 +185,7 @@ impl MssqlConnection {
 
         debug!("Executing command with {} parameters", params.len());
 
-        // For now, we only support parameterless execution
-        let result = client.execute(sql, &[]).await;
+        let result = bind_query(sql, params).execute(&mut *client).await;
 
         let result = result.map_err(|e| {
             error!("Command execution failed: {}", e);
