@@ -238,7 +238,7 @@ impl ConditionalBuilder {
     /// Add a condition if the value is Some.
     pub fn where_if<V: std::fmt::Display>(mut self, column: &str, value: Option<V>) -> Self {
         if let Some(v) = value {
-            self.conditions.push(format!("{} = '{}'", column, v));
+            self.conditions.push(format!("{} = '{}'", column, v.to_string().replace('\'', "''")));
         }
         self
     }
@@ -260,13 +260,13 @@ impl ConditionalBuilder {
     ) -> Self {
         match (min, max) {
             (Some(mi), Some(ma)) => {
-                self.conditions.push(format!("{} BETWEEN '{}' AND '{}'", column, mi, ma));
+                self.conditions.push(format!("{} BETWEEN '{}' AND '{}'", column, mi.to_string().replace('\'', "''"), ma.to_string().replace('\'', "''")));
             }
             (Some(mi), None) => {
-                self.conditions.push(format!("{} >= '{}'", column, mi));
+                self.conditions.push(format!("{} >= '{}'", column, mi.to_string().replace('\'', "''")));
             }
             (None, Some(ma)) => {
-                self.conditions.push(format!("{} <= '{}'", column, ma));
+                self.conditions.push(format!("{} <= '{}'", column, ma.to_string().replace('\'', "''")));
             }
             (None, None) => {}
         }
@@ -279,7 +279,7 @@ impl ConditionalBuilder {
         I: IntoIterator<Item = V>,
         V: std::fmt::Display,
     {
-        let vals: Vec<String> = values.into_iter().map(|v| format!("'{}'", v)).collect();
+        let vals: Vec<String> = values.into_iter().map(|v| format!("'{}'", v.to_string().replace('\'', "''"))).collect();
         if !vals.is_empty() {
             self.conditions.push(format!("{} IN ({})", column, vals.join(", ")));
         }
@@ -373,6 +373,19 @@ mod tests {
 
         assert!(sql.contains("@p"));
         assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn test_conditional_builder_escapes_quotes() {
+        let query = conditional("SELECT * FROM users")
+            .where_if("name", Some("O'Brien"))
+            .between_if("name", Some("A'B"), Some("C'D"))
+            .in_if("name", ["O'Brien", "Jane"])
+            .build();
+        assert!(query.contains("O''Brien"));
+        assert!(query.contains("A''B"));
+        assert!(query.contains("C''D"));
+        assert!(!query.contains("'O'Brien'"));
     }
 
     #[test]
