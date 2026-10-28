@@ -112,7 +112,7 @@ impl<'a> Transaction<'a> {
 
         // Begin transaction
         let begin_sql = match &self.name {
-            Some(name) => format!("BEGIN TRANSACTION [{}]", name),
+            Some(name) => format!("BEGIN TRANSACTION [{}]", name.replace(']', "]]")),
             None => "BEGIN TRANSACTION".to_string(),
         };
         self.connection.execute_batch(&begin_sql).await?;
@@ -132,7 +132,7 @@ impl<'a> Transaction<'a> {
         debug!("Committing transaction");
 
         let commit_sql = match &self.name {
-            Some(name) => format!("COMMIT TRANSACTION [{}]", name),
+            Some(name) => format!("COMMIT TRANSACTION [{}]", name.replace(']', "]]")),
             None => "COMMIT TRANSACTION".to_string(),
         };
 
@@ -144,6 +144,11 @@ impl<'a> Transaction<'a> {
             }
             Err(e) => {
                 error!("Transaction commit failed: {}", e);
+                // A failed COMMIT does not prove SQL Server rolled back.
+                // Attempt an explicit rollback before marking the state closed.
+                if let Err(rollback_error) = self.connection.execute_batch("ROLLBACK TRANSACTION").await {
+                    error!("Rollback after failed commit also failed: {}", rollback_error);
+                }
                 self.state = TransactionState::RolledBack;
                 Err(MssqlError::Transaction(TransactionError::CommitFailed(
                     e.to_string(),
@@ -161,7 +166,7 @@ impl<'a> Transaction<'a> {
         debug!("Rolling back transaction");
 
         let rollback_sql = match &self.name {
-            Some(name) => format!("ROLLBACK TRANSACTION [{}]", name),
+            Some(name) => format!("ROLLBACK TRANSACTION [{}]", name.replace(']', "]]")),
             None => "ROLLBACK TRANSACTION".to_string(),
         };
 
@@ -182,7 +187,7 @@ impl<'a> Transaction<'a> {
         debug!("Creating savepoint: {}", name);
 
         self.connection
-            .execute_batch(&format!("SAVE TRANSACTION [{}]", name))
+            .execute_batch(&format!("SAVE TRANSACTION [{}]", name.replace(']', "]]")))
             .await?;
 
         self.savepoints.push(name.clone());
@@ -206,7 +211,7 @@ impl<'a> Transaction<'a> {
         debug!("Rolling back to savepoint: {}", name);
 
         self.connection
-            .execute_batch(&format!("ROLLBACK TRANSACTION [{}]", name))
+            .execute_batch(&format!("ROLLBACK TRANSACTION [{}]", name.replace(']', "]]")))
             .await?;
 
         // Remove all savepoints after this one
