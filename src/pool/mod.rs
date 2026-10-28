@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::{debug, error, info};
 
-use crate::connection::{ConnectionConfig, MssqlConnection, MssqlRow};
+use crate::connection::{bind_query, ConnectionConfig, MssqlConnection, MssqlRow};
 use crate::error::{ConnectionError, MssqlError, MssqlResult, PoolError};
 use crate::types::SqlValue;
 
@@ -321,10 +321,10 @@ pub struct PooledMssqlConnection<'a> {
 
 impl<'a> PooledMssqlConnection<'a> {
     /// Execute a query that returns rows.
-    pub async fn query(&mut self, sql: &str, _params: &[SqlValue]) -> MssqlResult<Vec<MssqlRow>> {
+    pub async fn query(&mut self, sql: &str, params: &[SqlValue]) -> MssqlResult<Vec<MssqlRow>> {
         debug!("Executing pooled query: {}", sql);
 
-        let stream = self.conn.client.query(sql, &[]).await.map_err(MssqlError::Driver)?;
+        let stream = bind_query(sql, params).query(&mut self.conn.client).await.map_err(MssqlError::Driver)?;
 
         let rows = stream_to_rows(stream).await?;
         Ok(rows)
@@ -342,10 +342,10 @@ impl<'a> PooledMssqlConnection<'a> {
     }
 
     /// Execute a non-query command.
-    pub async fn execute(&mut self, sql: &str, _params: &[SqlValue]) -> MssqlResult<u64> {
+    pub async fn execute(&mut self, sql: &str, params: &[SqlValue]) -> MssqlResult<u64> {
         debug!("Executing pooled command: {}", sql);
 
-        let result = self.conn.client.execute(sql, &[]).await.map_err(MssqlError::Driver)?;
+        let result = bind_query(sql, params).execute(&mut self.conn.client).await.map_err(MssqlError::Driver)?;
         Ok(result.total())
     }
 
